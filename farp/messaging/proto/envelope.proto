@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+option go_package = "github.com/benisong/bitchat/farp/messaging/pb";
+
+package farp;
+
+message Envelope {
+  bytes sender_pubkey   = 1;
+  bytes recipient_pubkey = 2;
+  uint64 epoch           = 3;
+  bytes ephemeral_pubkey = 4;
+  bytes ciphertext       = 5;
+  bytes nonce            = 6;
+  uint64 timestamp_unix  = 7;
+  bytes signature        = 8;
+
+  enum Type {
+    DIRECT_MESSAGE     = 0;
+    OFFLINE_FRAGMENT   = 1;
+    ADDRESS_QUERY_REQ  = 2;
+    ADDRESS_QUERY_RESP = 3;
+    MIGRATION_ANNOUNCE = 4;
+    WITNESS_SIGNATURE  = 5;
+    PING               = 6;
+    PONG               = 7;
+    RELAY_REQUEST      = 8;
+    RELAY_DELIVERY     = 9;
+    FRAGMENT_ACK       = 10;
+    SOLO_MIGRATION     = 11;
+  }
+  Type type = 9;
+}
+
+message OfflineFragment {
+  bytes payload       = 1; // 完整加密 Envelope 的 bytes
+  uint64 expires_at   = 2; // unix s
+  bytes sender_sig    = 3; // sender 对 payload hash 的签名
+}
+
+message ServiceAuthorization {
+  bytes sender_pubkey = 1;
+  bytes relay_pubkey  = 2;
+  int64 amount        = 3; // units, >=1
+  uint64 nonce        = 4;
+  int64 expires_at    = 5;
+  bytes signature     = 6; // Ed25519( sha3_256( serialized_fields ) )
+}
