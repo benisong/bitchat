@@ -1,117 +1,340 @@
 package messaging
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/benisong/bitchat/farp/identity"
+	"github.com/benisong/bitchat/farp/protocol"
 )
 
-// Envelope 标准消息信封
-// 版本 v1 用简化 Noise 第一奏率採动，不快的是完整 X3DH+双横步
+const (
+	CurrentEnvelopeVersion      uint16 = 1
+	CurrentAuthorizationVersion uint16 = 1
+	MessageIDSize                      = 16
+	TaskIDSize                         = 16
+	MaxEnvelopeCiphertext              = 1024 * 1024
+	MaxEnvelopeHops             uint16 = 16
+	MaxEnvelopeLifetime                = 30 * 24 * time.Hour
+	MaxAuthorizationLifetime           = 24 * time.Hour
+	MaxFutureClockSkew                 = 5 * time.Minute
+)
+
+var (
+	ErrInvalidEnvelope      = errors.New("invalid FARP envelope")
+	ErrInvalidSignature     = errors.New("invalid protocol signature")
+	ErrEnvelopeExpired      = errors.New("FARP envelope expired")
+	ErrInvalidAuthorization = errors.New("invalid service authorization")
+)
 
 type Envelope struct {
-	SenderPubkey     []byte
-	RecipientPubkey  []byte
-	Epoch            uint64
-	EphemeralPubkey  []byte
-	Ciphertext       []byte
-	Nonce            []byte
-	TimestampUnix    uint64
-	Signature        []byte
-	Type             EnvelopeType
+	Version             uint16
+	MessageID           []byte
+	TaskID              []byte
+	SenderAccountPubkey []byte
+	RecipientPubkey     []byte
+	DeviceCertificate   identity.DeviceCertificate
+	EphemeralPubkey     []byte
+	Ciphertext          []byte
+	Nonce               []byte
+	CreatedAtUnix       int64
+	ExpiresAtUnix       int64
+	MaxHops             uint16
+	Type                EnvelopeType
+	Signature           []byte
 }
-
-// EnvelopeType 消息类型
-// 数值应与 proto 定义保持一致
 
 type EnvelopeType uint8
 
 const (
-	TypeDirectMessage    EnvelopeType = 0
-	TypeOfflineFragment  EnvelopeType = 1
-	TypeAddressQueryReq  EnvelopeType = 2
-	TypeAddressQueryResp EnvelopeType = 3
-	TypeMigrationAnnounce EnvelopeType = 4
-	TypeWitnessSignature EnvelopeType = 5
-	TypePing             EnvelopeType = 6
-	TypePong             EnvelopeType = 7
-	TypeRelayRequest     EnvelopeType = 8
-	TypeRelayDelivery      EnvelopeType = 9
-	TypeFragmentACK        EnvelopeType = 10
-	TypeSoloMigration     EnvelopeType = 11
+	TypeDirectMessage EnvelopeType = iota
+	TypeOfflineFragment
+	TypeAddressQueryReq
+	TypeAddressQueryResp
+	TypeMigrationAnnounce
+	TypeWitnessSignature
+	TypePing
+	TypePong
+	TypeRelayRequest
+	TypeRelayDelivery
+	TypeFragmentACK
+	TypeSoloMigration
 )
 
-// Serialize 序列化签名垄（除了 Signature 的所有字段）
-// 用于签名验证
-func (e *Envelope) signPayload() []byte {
-	// MVP 用写死简易版本：按固定顺序拼接
-	return []byte(fmt.Sprintf("%x|%x|%d|%x|%x|%d|%d",
-		e.SenderPubkey, e.RecipientPubkey, e.Epoch,
-		e.EphemeralPubkey, e.Nonce, e.TimestampUnix, e.Type,
-	))
+func (t EnvelopeType) valid() bool {
+	return t >= TypeDirectMessage && t <= TypeSoloMigration
 }
 
-// Sign 用发送方私钥签名
-func (e *Envelope) Sign(node *identity.Node) {
-	payload := e.signPayload()
-	// 签名约另见 identity
-	e.Signature = node.Sign([]byte(payload))
+func NewEnvelope(
+	node *identity.Node,
+	recipientPubkey []byte,
+	ephemeralPubkey []byte,
+	ciphertext []byte,
+	nonce []byte,
+	typeValue EnvelopeType,
+	ttl time.Duration,
+	maxHops uint16,
+) (*Envelope, error) {
+	messageID := make([]byte, MessageIDSize)
+	if _, err := rand.Read(messageID); err != nil {
+		return nil, fmt.Errorf("message id: %w", err)
+	}
+	now := time.Now().UTC()
+	envelope := &Envelope{
+		Version:         CurrentEnvelopeVersion,
+		MessageID:       messageID,
+		RecipientPubkey: cloneBytes(recipientPubkey),
+		EphemeralPubkey: cloneBytes(ephemeralPubkey),
+		Ciphertext:      cloneBytes(ciphertext),
+		Nonce:           cloneBytes(nonce),
+		CreatedAtUnix:   now.Unix(),
+		ExpiresAtUnix:   now.Add(ttl).Unix(),
+		MaxHops:         maxHops,
+		Type:            typeValue,
+	}
+	if err := envelope.Sign(node); err != nil {
+		return nil, err
+	}
+	return envelope, nil
 }
 
-// Verify 验证签名
-func (e *Envelope) Verify(pubkey []byte) bool {
-	// TODO: 用 Ed25519验证公钥签名
-	_ = pubkey
-	return true // MVP 先简化
+func (e *Envelope) SigningBytes() ([]byte, error) {
+	certificate, err := e.DeviceCertificate.CanonicalBytes()
+	if err != nil {
+		return nil, err
+	}
+	b := protocol.NewBuilder("FARP_ENVELOPE_V1")
+	b.Uint16(e.Version)
+	b.Field(e.MessageID)
+	b.Field(e.TaskID)
+	b.Field(e.SenderAccountPubkey)
+	b.Field(e.RecipientPubkey)
+	b.Field(certificate)
+	b.Field(e.EphemeralPubkey)
+	b.Field(e.Ciphertext)
+	b.Field(e.Nonce)
+	b.Int64(e.CreatedAtUnix)
+	b.Int64(e.ExpiresAtUnix)
+	b.Uint16(e.MaxHops)
+	b.Uint8(uint8(e.Type))
+	return b.Build()
 }
 
-// IsExpired 检查时间戳是否偏差超过允许范围
-// 公共节点接收时用于放重放手
-func (e *Envelope) IsExpired() bool {
-	return time.Now().Unix() > int64(e.TimestampUnix)+300
+func (e *Envelope) Sign(node *identity.Node) error {
+	if node == nil {
+		return ErrInvalidEnvelope
+	}
+	if err := node.Validate(); err != nil {
+		return err
+	}
+	e.Version = CurrentEnvelopeVersion
+	e.SenderAccountPubkey = cloneBytes(node.AccountKey.Pub)
+	e.DeviceCertificate = cloneCertificate(node.Certificate)
+	if err := e.validate(time.Now().UTC(), false); err != nil {
+		return err
+	}
+	payload, err := e.SigningBytes()
+	if err != nil {
+		return err
+	}
+	e.Signature = node.Sign(payload)
+	return nil
 }
 
-// AuthWrapper 包含 ServiceAuthorization 的中继包装
-// 用于 NAT不可达时的付费中继
+func (e *Envelope) Verify(now time.Time) error {
+	if err := e.validate(now.UTC(), true); err != nil {
+		return err
+	}
+	if err := e.DeviceCertificate.Verify(); err != nil {
+		return err
+	}
+	if !equalBytes(e.SenderAccountPubkey, e.DeviceCertificate.AccountPubkey) {
+		return ErrInvalidEnvelope
+	}
+	payload, err := e.SigningBytes()
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(ed25519.PublicKey(e.DeviceCertificate.DevicePubkey), payload, e.Signature) {
+		return ErrInvalidSignature
+	}
+	return nil
+}
+
+func (e *Envelope) IsExpired(now time.Time) bool {
+	return now.UTC().Unix() > e.ExpiresAtUnix
+}
+
+func (e *Envelope) validate(now time.Time, requireSignature bool) error {
+	if e == nil ||
+		e.Version != CurrentEnvelopeVersion ||
+		len(e.MessageID) != MessageIDSize ||
+		(len(e.TaskID) != 0 && len(e.TaskID) != TaskIDSize) ||
+		len(e.SenderAccountPubkey) != ed25519.PublicKeySize ||
+		len(e.RecipientPubkey) != ed25519.PublicKeySize ||
+		len(e.EphemeralPubkey) != 32 ||
+		len(e.Ciphertext) == 0 || len(e.Ciphertext) > MaxEnvelopeCiphertext ||
+		(len(e.Nonce) != 12 && len(e.Nonce) != 24) ||
+		e.CreatedAtUnix <= 0 ||
+		e.ExpiresAtUnix <= e.CreatedAtUnix ||
+		e.MaxHops == 0 || e.MaxHops > MaxEnvelopeHops ||
+		!e.Type.valid() {
+		return ErrInvalidEnvelope
+	}
+	createdAt := time.Unix(e.CreatedAtUnix, 0).UTC()
+	expiresAt := time.Unix(e.ExpiresAtUnix, 0).UTC()
+	if createdAt.After(now.Add(MaxFutureClockSkew)) || expiresAt.Sub(createdAt) > MaxEnvelopeLifetime {
+		return ErrInvalidEnvelope
+	}
+	if now.After(expiresAt) {
+		return ErrEnvelopeExpired
+	}
+	if requireSignature && len(e.Signature) != ed25519.SignatureSize {
+		return ErrInvalidSignature
+	}
+	return nil
+}
 
 type AuthWrapper struct {
 	Envelope *Envelope
 	Auth     *ServiceAuthorization
 }
 
-// ServiceAuthorization 发送方给接单节点的付费护权
-// 签名后 Relay 凭此因过接单运输
-
+// ServiceAuthorization allows one provider to consume a positive amount of local credit.
 type ServiceAuthorization struct {
-	SenderPubkey []byte
-	RelayPubkey  []byte
-	Amount       int64  // units, >=1
-	Nonce        uint64
-	ExpiresAt    int64
-	Signature    []byte
+	Version             uint16
+	TaskID              []byte
+	SenderAccountPubkey []byte
+	ProviderPubkey      []byte
+	Amount              int64
+	Nonce               []byte
+	IssuedAtUnix        int64
+	ExpiresAtUnix       int64
+	DeviceCertificate   identity.DeviceCertificate
+	Signature           []byte
 }
 
-func (sa *ServiceAuthorization) signPayload() []byte {
-	return []byte(fmt.Sprintf("%x|%x|%d|%d|%d",
-		sa.SenderPubkey, sa.RelayPubkey, sa.Amount, sa.Nonce, sa.ExpiresAt,
-	))
+func (a *ServiceAuthorization) SigningBytes() ([]byte, error) {
+	certificate, err := a.DeviceCertificate.CanonicalBytes()
+	if err != nil {
+		return nil, err
+	}
+	b := protocol.NewBuilder("FARP_SERVICE_AUTHORIZATION_V1")
+	b.Uint16(a.Version)
+	b.Field(a.TaskID)
+	b.Field(a.SenderAccountPubkey)
+	b.Field(a.ProviderPubkey)
+	b.Int64(a.Amount)
+	b.Field(a.Nonce)
+	b.Int64(a.IssuedAtUnix)
+	b.Int64(a.ExpiresAtUnix)
+	b.Field(certificate)
+	return b.Build()
 }
 
-func (sa *ServiceAuthorization) Sign(node *identity.Node) {
-	sa.Signature = node.Sign([]byte(sa.signPayload()))
+func (a *ServiceAuthorization) Sign(node *identity.Node) error {
+	if node == nil {
+		return ErrInvalidAuthorization
+	}
+	if err := node.Validate(); err != nil {
+		return err
+	}
+	a.Version = CurrentAuthorizationVersion
+	a.SenderAccountPubkey = cloneBytes(node.AccountKey.Pub)
+	a.DeviceCertificate = cloneCertificate(node.Certificate)
+	if err := a.validate(time.Now().UTC(), false); err != nil {
+		return err
+	}
+	payload, err := a.SigningBytes()
+	if err != nil {
+		return err
+	}
+	a.Signature = node.Sign(payload)
+	return nil
 }
 
-func (sa *ServiceAuthorization) Verify(pubkey []byte) bool {
-	// TODO: MVP 简化
-	_ = pubkey
-	return true
+func (a *ServiceAuthorization) Verify(now time.Time) error {
+	if err := a.validate(now.UTC(), true); err != nil {
+		return err
+	}
+	if err := a.DeviceCertificate.Verify(); err != nil {
+		return err
+	}
+	if !equalBytes(a.SenderAccountPubkey, a.DeviceCertificate.AccountPubkey) {
+		return ErrInvalidAuthorization
+	}
+	payload, err := a.SigningBytes()
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(ed25519.PublicKey(a.DeviceCertificate.DevicePubkey), payload, a.Signature) {
+		return ErrInvalidSignature
+	}
+	return nil
 }
 
-// OfflineFragment 离线碎片
+func (a *ServiceAuthorization) validate(now time.Time, requireSignature bool) error {
+	if a == nil ||
+		a.Version != CurrentAuthorizationVersion ||
+		len(a.TaskID) != TaskIDSize ||
+		len(a.SenderAccountPubkey) != ed25519.PublicKeySize ||
+		len(a.ProviderPubkey) != ed25519.PublicKeySize ||
+		a.Amount <= 0 ||
+		len(a.Nonce) != 16 ||
+		a.IssuedAtUnix <= 0 ||
+		a.ExpiresAtUnix <= a.IssuedAtUnix {
+		return ErrInvalidAuthorization
+	}
+	issuedAt := time.Unix(a.IssuedAtUnix, 0).UTC()
+	expiresAt := time.Unix(a.ExpiresAtUnix, 0).UTC()
+	if issuedAt.After(now.Add(MaxFutureClockSkew)) || expiresAt.Sub(issuedAt) > MaxAuthorizationLifetime || now.After(expiresAt) {
+		return ErrInvalidAuthorization
+	}
+	if requireSignature && len(a.Signature) != ed25519.SignatureSize {
+		return ErrInvalidSignature
+	}
+	return nil
+}
 
+// OfflineFragment is deliberately opaque to custodians.
 type OfflineFragment struct {
-	Payload     []byte
-	ExpiresAt   int64
-	SenderSig   []byte
+	Version       uint16
+	TaskID        []byte
+	Ciphertext    []byte
+	NextHopToken  []byte
+	ExpiresAtUnix int64
+}
+
+func cloneCertificate(value identity.DeviceCertificate) identity.DeviceCertificate {
+	return identity.DeviceCertificate{
+		Version:              value.Version,
+		AccountPubkey:        cloneBytes(value.AccountPubkey),
+		DevicePubkey:         cloneBytes(value.DevicePubkey),
+		AgreementPubkey:      cloneBytes(value.AgreementPubkey),
+		PreviousDevicePubkey: cloneBytes(value.PreviousDevicePubkey),
+		DeviceID:             value.DeviceID,
+		Epoch:                value.Epoch,
+		IssuedAtUnix:         value.IssuedAtUnix,
+		Signature:            cloneBytes(value.Signature),
+	}
+}
+
+func cloneBytes(value []byte) []byte {
+	cloned := make([]byte, len(value))
+	copy(cloned, value)
+	return cloned
+}
+
+func equalBytes(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	var different byte
+	for i := range left {
+		different |= left[i] ^ right[i]
+	}
+	return different == 0
 }

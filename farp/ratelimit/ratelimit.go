@@ -22,21 +22,34 @@ type TokenBucket struct {
 type Manager struct {
 	mu       sync.RWMutex
 	buckets  map[string]*TokenBucket // key: peerID
-	capacity float64                // 当前全局容量
+	capacity float64                 // 当前全局容量
 }
 
 func NewManager() *Manager {
 	return &Manager{
 		buckets:  make(map[string]*TokenBucket),
-		capacity: config.BaseQuotaPerWindow,
+		capacity: config.MinQuotaPerWindow,
 	}
 }
 
-// SetCapacity 设置全局窗口容量
+// SetCapacity configures a node-wide capacity while preserving the 5-10 hard gate.
 func (m *Manager) SetCapacity(c int) {
+	if c < config.MinQuotaPerWindow {
+		c = config.MinQuotaPerWindow
+	}
+	if c > config.MaxQuotaPerWindow {
+		c = config.MaxQuotaPerWindow
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.capacity = float64(c)
+	for _, bucket := range m.buckets {
+		bucket.mu.Lock()
+		bucket.capacity = m.capacity
+		bucket.tokens = min(bucket.tokens, bucket.capacity)
+		bucket.mu.Unlock()
+	}
 }
 
 // forKey 拿到某个 peerID 的 bucket

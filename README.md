@@ -220,13 +220,15 @@ FARP 不以以下能力为目标：
 ```text
 cmd/daemon       本地核心守护进程入口
 cmd/cli          CLI 骨架
-farp/identity    Ed25519 身份骨架
-farp/messaging   消息信封和协议定义
+farp/identity    账户/设备签名身份、设备证书与 X25519 协商密钥
+farp/messaging   确定性消息信封和完整签名验证
 farp/ratelimit   内存限流器
 farp/pow         DHT 发布 PoW 实验
-farp/ledger      早期积分结构，后续将按无全局账本模型调整
+farp/contribution 永久贡献配额的本地状态
+farp/protocol    可签名对象的确定性编码
 internal/api     localhost HTTP API 骨架
-internal/db      SQLite schema
+internal/db      单一来源的 SQLite schema
+internal/identitystore 设备绑定的加密身份持久化
 ```
 
 当前代码可以通过编译检查：
@@ -235,7 +237,9 @@ internal/db      SQLite schema
 go test ./...
 ```
 
-但身份持久化、真实端到端加密、签名验证、DHT、Relay、CLI 请求、见证协议、配额消费和设备迁移仍未完成。现有 API 和消息验证中包含占位实现，请勿将其视为安全实现。
+当前已具备身份持久化、账户/设备密钥分离、设备证书、确定性签名负载和本地永久贡献状态。真实端到端加密、DHT、Relay、CLI 请求、见证协议、配额持久化和设备迁移仍未完成，请勿将当前版本视为生产级安全实现。
+
+本阶段的具体实现、安全边界、测试覆盖和未完成事项见 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md)。
 
 ## 建议推进顺序
 
